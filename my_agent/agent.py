@@ -3,86 +3,101 @@ import uvicorn
 import json
 import io
 import time
-import uuid
+import requests  # YENİ: Firebase REST API çağrıları için
 from datetime import datetime
 from typing import List, Optional
 import traceback
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# --- FIREBASE ---
+# --- FIREBASE IMPORTLARI ---
 import firebase_admin
-from firebase_admin import credentials, firestore, storage
-import firebase_admin
-from firebase_admin import credentials
+from firebase_admin import credentials, firestore, storage, auth  # auth EKLENDİ
 
+# --- AYARLAR VE PATH ---
 base_path = os.path.dirname(os.path.abspath(__file__))
 key_path = os.path.join(base_path, "serviceAccountKey.json")
 
-
-# .env dosyasını yükle
 load_dotenv()
 
-# --- GOOGLE ADK IMPORT ---
+# DİKKAT: Backend'in şifre doğrulaması yapabilmesi için Web API Key gereklidir.
+FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY")
+
+# --- GOOGLE GENAI (AI) IMPORT ---
 try:
     from google.genai import Client
 
     ADK_AVAILABLE = True
-    print("✅ Google GenAI kütüphanesi yüklendi")
 except ImportError:
     ADK_AVAILABLE = False
     print("⚠️ Google GenAI bulunamadı - Mock mode aktif")
 
-# --- PDF/DOCX ---
+# --- PDF/DOCX IMPORT ---
 try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
-
 try:
     from docx import Document
 except ImportError:
     Document = None
 
 # --- FIREBASE BAŞLATMA ---
-# serviceAccountKey.json dosyasının main.py ile aynı yerde olduğundan emin ol
 if not firebase_admin._apps:
     try:
-        cred = credentials.Certificate(key_path)
-        firebase_admin.initialize_app(cred, {
-            'storageBucket': 'hirelistic.firebasestorage.app'
-        })
-        print("✅ Firebase bağlantısı başarılı")
+        if os.path.exists(key_path):
+            cred = credentials.Certificate(key_path)
+            firebase_admin.initialize_app(cred, {
+                'storageBucket': 'hirelistic.appspot.com'
+            })
+            print(f"✅ Firebase bağlantısı başarılı")
+        else:
+            print(f"❌ HATA: serviceAccountKey.json bulunamadı!")
     except Exception as e:
-        print(f"⚠️ Firebase hatası: {e} (Mock modunda çalışamaz, serviceAccountKey.json gerekli)")
+        print(f"⚠️ Firebase başlatma hatası: {e}")
 
 db = firestore.client()
 bucket = storage.bucket()
 
-# FastAPI App
-app = FastAPI(title="Hirelytics Backend API", version="2.1.0")
+app = FastAPI(title="Hirelytics Backend API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Geliştirme için *
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# --- MODELLER ---
+# --- VERİ MODELLERİ ---
+
+# 1. Auth Modelleri (YENİ)
+class UserRegisterRequest(BaseModel):
+    email: str
+    password: str
+    role: str  # 'employer' veya 'candidate'
+
+
+class UserLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+# 2. İş İlanı Modeli
 class JobCreate(BaseModel):
     title: str
     company: str
     location: str
     type: str
     description: str
+    employer_id: str
 
 
+# 3. Analiz İsteği Modeli
 class AnalysisRequest(BaseModel):
     job_id: str
     candidate_id: str
@@ -91,7 +106,7 @@ class AnalysisRequest(BaseModel):
     cv_content: str
 
 
-# --- AGENT SINIFI ---
+# --- AI AGENT SINIFI (Aynı Kalıyor) ---
 class HirelyticsAgent:
     def __init__(self):
         self.api_key = os.getenv("GOOGLE_API_KEY")
@@ -105,33 +120,33 @@ class HirelyticsAgent:
             return self._mock_response(candidate_name)
 
         prompt = f"""
-Sen bir işe alım uzmanısın. Aşağıdaki iş tanımı ve CV'yi analiz et.
+           Sen bir işe alım uzmanısın. Aşağıdaki iş tanımı ve CV'yi analiz et.
 
-İŞ TANIMI:
-{job_desc}
+           İŞ TANIMI:
+           {job_desc}
 
-ADAY CV'Sİ ({candidate_name}):
-{cv_text}
+           ADAY CV'Sİ ({candidate_name}):
+           {cv_text}
 
-ÇIKTI FORMATI (Sadece saf JSON döndür, markdown kullanma):
-{{
-    "candidate_name": "{candidate_name}",
-    "scores": {{
-        "skill_match": 0-100,
-        "experience_match": 0-100,
-        "keyword_match": 0-100,
-        "total_score": 0-100
-    }},
-    "analysis": {{
-        "summary": "Kısa özet",
-        "strengths": ["güçlü yön 1", "güçlü yön 2"],
-        "missing_skills": ["eksik 1", "eksik 2"]
-    }}
-}}
-"""
+           ÇIKTI FORMATI (Sadece saf JSON döndür, markdown kullanma):
+           {{
+               "candidate_name": "{candidate_name}",
+               "scores": {{
+                   "skill_match": 0-100,
+                   "experience_match": 0-100,
+                   "keyword_match": 0-100,
+                   "total_score": 0-100
+               }},
+               "analysis": {{
+                   "summary": "Kısa özet",
+                   "strengths": ["güçlü yön 1", "güçlü yön 2"],
+                   "missing_skills": ["eksik 1", "eksik 2"]
+               }}
+           }}
+           """
         try:
             response = self.client.models.generate_content(
-                model="gemini-2.5-flash",  # Model adını kendine göre güncelle
+                model="gemini-2.5-flash",
                 contents=prompt
             )
             text = response.text.strip()
@@ -148,11 +163,16 @@ ADAY CV'Sİ ({candidate_name}):
     def _mock_response(self, name, error=None):
         return {
             "candidate_name": name,
-            "scores": {"total_score": 75, "skill_match": 70, "experience_match": 80, "keyword_match": 75},
+            "scores": {
+                "total_score": 75,      # snake_case (get_jobs bunu camelCase'e çevirecek)
+                "skill_match": 70,
+                "experience_match": 80,
+                "keyword_match": 75
+            },
             "analysis": {
                 "summary": f"Mock analiz (API hatası veya yok: {error})",
                 "strengths": ["Python", "Analitik"],
-                "missing_skills": ["Docker"]
+                "missing_skills": ["Docker"] # snake_case
             }
         }
 
@@ -164,17 +184,121 @@ agent = HirelyticsAgent()
 
 @app.get("/")
 def health_check():
-    return {"status": "Hirelytics Firebase API Çalışıyor"}
+    return {"status": "Hirelytics Backend V3 Çalışıyor"}
 
+
+# --- 1. AUTH İŞLEMLERİ (TAMAMEN BACKEND) ---
+
+@app.post("/api/auth/register")
+async def register_user(request: UserRegisterRequest):
+    """
+    1. Firebase Auth'da kullanıcı oluşturur (Admin SDK).
+    2. Firestore'a kullanıcı rolünü kaydeder.
+    """
+    try:
+        # 1. Firebase Auth Kullanıcısı Oluştur
+        try:
+            user_record = auth.create_user(
+                email=request.email,
+                password=request.password
+            )
+        except ValueError as e:
+            # Şifre kısa veya email formatı bozuksa buraya düşer
+            print(f"❌ Geçersiz Veri Hatası: {e}")
+            raise HTTPException(status_code=400, detail=f"Giriş bilgileri geçersiz: {str(e)}")
+
+        except firebase_admin.exceptions.FirebaseError as fe:
+            # Firebase tarafında bir çakışma veya sunucu hatası varsa
+            print(f"❌ Firebase Hatası: {fe}")
+            # Hata mesajını stringe çevirip detay verelim
+            error_message = str(fe)
+            if "EMAIL_EXISTS" in error_message or "already exists" in error_message:
+                raise HTTPException(status_code=400, detail="Bu e-posta adresi zaten kullanımda.")
+            else:
+                raise HTTPException(status_code=400, detail=f"Firebase Kayıt Hatası: {error_message}")
+
+        # 2. Firestore'a Rol Kaydet
+        user_data = {
+            "uid": user_record.uid,
+            "email": request.email,
+            "role": request.role,
+            "createdAt": datetime.now().isoformat()
+        }
+        db.collection('users').document(user_record.uid).set(user_data)
+
+        return {"message": "Kayıt başarılı", "uid": user_record.uid, "role": request.role}
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"❌ Genel Register Hatası: {e}")
+        traceback.print_exc()  # Terminalde tam hatayı gör
+        raise HTTPException(status_code=500, detail=f"Sunucu hatası: {str(e)}")
+
+@app.post("/api/auth/login")
+async def login_user(request: UserLoginRequest):
+    """
+    1. Firebase REST API kullanarak şifre doğrular.
+    2. Firestore'dan kullanıcının rolünü çeker.
+    """
+    if not FIREBASE_WEB_API_KEY:
+        raise HTTPException(status_code=500, detail="Backend configuration error: FIREBASE_WEB_API_KEY eksik.")
+
+    # 1. Firebase REST API ile Şifre Doğrulama
+    login_url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_WEB_API_KEY}"
+    payload = {
+        "email": request.email,
+        "password": request.password,
+        "returnSecureToken": True
+    }
+
+    try:
+        response = requests.post(login_url, json=payload)
+        res_json = response.json()
+
+        if "error" in res_json:
+            error_msg = res_json['error']['message']
+            if "INVALID_PASSWORD" in error_msg or "EMAIL_NOT_FOUND" in error_msg:
+                raise HTTPException(status_code=401, detail="E-posta veya şifre hatalı.")
+            raise HTTPException(status_code=400, detail=f"Giriş başarısız: {error_msg}")
+
+        local_id = res_json['localId']  # UID
+        id_token = res_json['idToken']
+
+        # 2. Firestore'dan Rolü Getir
+        user_doc = db.collection('users').document(local_id).get()
+        if not user_doc.exists:
+            raise HTTPException(status_code=404, detail="Kullanıcı profili bulunamadı.")
+
+        user_data = user_doc.to_dict()
+        role = user_data.get('role', 'candidate')  # Varsayılan candidate
+
+        return {
+            "uid": local_id,
+            "email": request.email,
+            "token": id_token,
+            "role": role,
+            "message": "Giriş başarılı"
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Login Error: {e}")
+        raise HTTPException(status_code=500, detail="Sunucu hatası")
+
+
+# --- 2. İŞ İLANI İŞLEMLERİ (Aynı) ---
+@app.get("/api/jobs")
+# --- agent.py dosyasındaki get_jobs fonksiyonunu bununla değiştir ---
 
 @app.get("/api/jobs")
 async def get_jobs():
-    """Tüm işleri ve altındaki adayları getir"""
     try:
         jobs_ref = db.collection('jobs')
         docs = jobs_ref.stream()
-
         all_jobs = []
+
         for doc in docs:
             job_data = doc.to_dict()
             job_data['id'] = doc.id
@@ -189,81 +313,68 @@ async def get_jobs():
 
             job_data['candidates'] = candidates
 
-            # Frontend için analiz sonuçlarını derle
+            # --- DÜZELTME BURADA YAPILDI ---
+            # Frontend (React) camelCase beklerken, AI snake_case üretiyor.
+            # Bu yüzden burada manuel eşleştirme (mapping) yapıyoruz.
             results = []
             for c in candidates:
                 if c.get('analysis_result'):
                     res = c['analysis_result']
-                    # Frontend yapısına uydurma
+
+                    # Güvenli veri çekme (Hata almamak için boş sözlük {})
+                    scores = res.get("scores", {})
+                    analysis = res.get("analysis", {})
+
                     results.append({
-                        "candidateName": res.get("candidate_name"),
+                        "candidateName": res.get("candidate_name", c.get('name')),
                         "scores": {
-                            "totalScore": res["scores"].get("total_score", 0),
-                            "skillMatch": res["scores"].get("skill_match", 0),
-                            "experienceMatch": res["scores"].get("experience_match", 0),
-                            "keywordMatch": res["scores"].get("keyword_match", 0)
+                            # Python (total_score) -> React (totalScore) çevirimi
+                            "totalScore": scores.get("total_score", 0),
+                            "skillMatch": scores.get("skill_match", 0),
+                            "experienceMatch": scores.get("experience_match", 0),
+                            "keywordMatch": scores.get("keyword_match", 0)
                         },
                         "analysis": {
-                            "summary": res["analysis"].get("summary", ""),
-                            "strengths": res["analysis"].get("strengths", []),
-                            "missingSkills": res["analysis"].get("missing_skills", [])
+                            "summary": analysis.get("summary", "Özet yok"),
+                            "strengths": analysis.get("strengths", []),
+                            # Python (missing_skills) -> React (missingSkills) çevirimi
+                            "missingSkills": analysis.get("missing_skills", [])
                         },
                         "isError": False
                     })
-            job_data['analysisResults'] = results
 
+            job_data['analysisResults'] = results
             all_jobs.append(job_data)
 
         return all_jobs
     except Exception as e:
         print(f"Get Jobs Hatası: {e}")
-        return []  # Hata olursa boş liste dön
-
+        # Detaylı hata görmek için:
+        traceback.print_exc()
+        return []
 
 
 @app.post("/api/jobs")
 async def create_job(job: JobCreate):
-    """Yeni iş ilanı ekle"""
-    print("📥 İlan Ekleme İsteği Geldi...")
-    print(f"📦 Veri: {job}")
-
     try:
-        # Veritabanı bağlantısı var mı kontrol et
-        if db is None:
-            raise Exception("Veritabanı bağlantısı (db) başlatılamadı. serviceAccountKey.json dosyasını kontrol edin.")
-
         new_job = job.dict()
         new_job['created_at'] = datetime.now().isoformat()
         new_job['status'] = "Açık"
-
-        # Adaylar listesi boş olarak başlatılsın (Frontend hatasını önlemek için)
-        new_job['candidates'] = []
-        new_job['analysisResults'] = []
-
-        print("🔥 Firestore'a yazılıyor...")
         _, ref = db.collection('jobs').add(new_job)
-
-        print(f"✅ Başarılı! ID: {ref.id}")
         return {"id": ref.id, "message": "İş oluşturuldu", "status": "success"}
-
     except Exception as e:
-        print("❌ HATA OLUŞTU (create_job):")
-        print("-" * 60)
-        traceback.print_exc()  # Hatanın tüm detayını terminale basar
-        print("-" * 60)
-        # Frontend'e hatayı string olarak dönüyoruz ki alert'te görebilesin
-        raise HTTPException(status_code=500, detail=f"Sunucu Hatası: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- 3. CV YÜKLEME VE ANALİZ (Aynı) ---
 @app.post("/api/upload-cv")
-async def upload_cv(file: UploadFile = File(...), job_id: str = Form(...)):
-    """
-    DEĞİŞİKLİK: Dosyayı Cloud Storage'a yüklemek yerine
-    sadece metni okuyup Firestore'a kaydeder.
-    Böylece 'Billing/Upgrade' sorunu çözülür.
-    """
+async def upload_cv(
+        file: UploadFile = File(...),
+        job_id: str = Form(...),
+        candidate_id: str = Form(default="unknown"),
+        candidate_email: str = Form(default="unknown")
+):
     try:
-        # 1. Metin Çıkarma (Burası aynı kalıyor)
         content = ""
         file_bytes = await file.read()
         filename = file.filename.lower()
@@ -271,8 +382,7 @@ async def upload_cv(file: UploadFile = File(...), job_id: str = Form(...)):
         if filename.endswith(".pdf") and PdfReader:
             reader = PdfReader(io.BytesIO(file_bytes))
             for page in reader.pages:
-                text = page.extract_text()
-                if text: content += text + "\n"
+                if page.extract_text(): content += page.extract_text() + "\n"
         elif filename.endswith(".docx") and Document:
             doc = Document(io.BytesIO(file_bytes))
             for para in doc.paragraphs: content += para.text + "\n"
@@ -281,37 +391,20 @@ async def upload_cv(file: UploadFile = File(...), job_id: str = Form(...)):
         else:
             content = "Metin okunamadı."
 
-        # EĞER METİN BOŞSA HATA VERELİM
-        if not content.strip():
-            return {"message": "Dosyadan metin okunamadı, resim formatında olabilir.", "url": "#"}
-
-        # 2. STORAGE ADIMINI ATLIYORUZ (İptal edilen kısım)
-        # blob = bucket.blob(...)  <-- BU SATIRLARI SİLDİK
-        # blob.upload_from_string(...)
-
-        # Onun yerine sahte bir URL veriyoruz (Frontend hata vermesin diye)
-        fake_url = "https://dosya-yuklenmedi-sadece-metin-analizi.com"
-
-        # 3. Firestore'a Ekle (Metni kaydediyoruz, bu bize yeter)
+        fake_url = "https://text-only-mode.com"
         new_candidate = {
+            "candidate_id": candidate_id,
+            "email": candidate_email,
             "name": file.filename,
-            "email": "belirsiz@ornek.com",
-            "cv_url": fake_url,  # Gerçek dosya yok, ama sorun değil
-            "content": content.strip(),  # ASIL ÖNEMLİ OLAN BU
+            "cv_url": fake_url,
+            "content": content.strip(),
             "isParsed": True,
             "appliedAt": datetime.now().isoformat(),
             "analysis_result": None
         }
-
-        # Veritabanına yaz
         db.collection('jobs').document(job_id).collection('candidates').add(new_candidate)
-
-        return {"message": "Başarılı (Depolama atlandı)", "url": fake_url}
-
+        return {"message": "Başvuru başarılı", "url": fake_url}
     except Exception as e:
-        print(f"Upload Hatası: {e}")
-        # Detaylı hata görelim
-        traceback.print_exc()
         raise HTTPException(500, str(e))
 
 
@@ -321,11 +414,10 @@ async def analyze_candidate_endpoint(request: AnalysisRequest):
     try:
         result = agent.analyze(request.job_description, request.cv_content, request.candidate_name)
 
-        # Firestore güncelle
         if request.job_id and request.candidate_id:
-            ref = db.collection('jobs').document(request.job_id) \
-                .collection('candidates').document(request.candidate_id)
-            ref.update({"analysis_result": result})
+            db.collection('jobs').document(request.job_id) \
+                .collection('candidates').document(request.candidate_id) \
+                .update({"analysis_result": result})
 
         return result
     except Exception as e:
